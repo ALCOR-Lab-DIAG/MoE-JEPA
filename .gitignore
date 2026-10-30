@@ -1,0 +1,6 @@
+/og_code/
+__pycache__/
+*.ckpt
+*.safetensors
+checkpoints/
+test_results_json.txt

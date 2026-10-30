@@ -43,6 +43,8 @@ Tampered decision.
 ```
 MoE-JEPA/
 ├── README.md
+├── requirements.txt
+├── predict.py          # classify single images with the released checkpoint
 ├── model/
 │   └── model.py        # all architecture components:
 │                       #   - frozen V-JEPA 2 ViT-L backbone
@@ -50,27 +52,88 @@ MoE-JEPA/
 │                       #   - Gated Attention MIL pooling
 │                       #   - BayarConv noise branch + CNN
 │                       #   - adaptive gated fusion + classifier head
-└── train/
-    ├── train.py        # training on SID-Set
-    └── test.py         # evaluation on SID-Set / RRDataset
+│                       #   - load_moejepa() / preprocess_image() helpers
+├── train/
+│   ├── train.py        # training on SID-Set
+│   └── test.py         # evaluation on SID-Set / RRDataset
+└── scripts/
+    └── export_checkpoint.py  # Lightning .ckpt -> release .safetensors
 ```
 
 ## Installation
 
 ```bash
-git clone https://github.com/<user>/MoE-JEPA.git
+git clone https://github.com/ALCOR-Lab-DIAG/MoE-JEPA.git
 cd MoE-JEPA
-conda create -n moejepa python=3.10 -y
+conda create -n moejepa python=3.12 -y
 conda activate moejepa
 pip install -r requirements.txt
 ```
 
-<!-- TODO: add requirements.txt, and note the torch / CUDA versions you actually trained on. -->
+Tested with Python 3.14, PyTorch 2.11, transformers 5.3 and Lightning 2.6 on a single GPU.
 
-The frozen V-JEPA 2 ViT-L weights are downloaded separately — see
-[facebookresearch/vjepa2](https://github.com/facebookresearch/vjepa2).
+The frozen V-JEPA 2 ViT-L backbone
+([`facebook/vjepa2-vitl-fpc64-256`](https://huggingface.co/facebook/vjepa2-vitl-fpc64-256))
+is downloaded automatically from the Hugging Face Hub on first use. Pass `--model_name`
+to point the scripts at a local copy instead.
 
-<!-- TODO: state where model.py expects the checkpoint (path or env var). -->
+## Pretrained checkpoint
+
+The SID-Set checkpoint is attached to the
+[v1.0 release](https://github.com/ALCOR-Lab-DIAG/MoE-JEPA/releases/tag/v1.0):
+
+```bash
+wget https://github.com/ALCOR-Lab-DIAG/MoE-JEPA/releases/download/v1.0/moejepa_sidset.safetensors
+```
+
+| File | Size | SHA-256 |
+|---|---|---|
+| `moejepa_sidset.safetensors` | 618 MB | `7987fbf785e325dc6f511134989abc3d88f79e31cf609c3ef9099f8e426ecfb9` |
+
+It holds only the weights trained on SID-Set (MoE routers and routed experts, MIL pooler,
+noise branch, fusion gate, classifier) together with the hyperparameters. The frozen
+backbone and shared experts are rebuilt from the V-JEPA 2 weights at load time.
+
+## Usage
+
+**Inference on your own images.** Labels are `real`, `fake` (fully synthetic) and `tampered`.
+
+```bash
+python predict.py --checkpoint moejepa_sidset.safetensors path/to/image.jpg
+```
+
+From Python:
+
+```python
+from PIL import Image
+from model.model import load_moejepa, load_processor, preprocess_image, LABELS
+
+model = load_moejepa("moejepa_sidset.safetensors", device="cuda")
+processor = load_processor()
+
+x = preprocess_image(Image.open("image.jpg"), processor).unsqueeze(0).to("cuda")
+probs = model(x).softmax(dim=-1)[0]
+print(LABELS[probs.argmax()], probs.tolist())
+```
+
+V-JEPA 2 is a video encoder, so `preprocess_image` repeats each image into a static
+4-frame clip, the same input format used during training.
+
+**Evaluation.** `--dataset` is either a dataset saved with `save_to_disk()` or a Hugging
+Face Hub id; labels must follow SID-Set (0 = real, 1 = fully synthetic, 2 = tampered).
+
+```bash
+python train/test.py --checkpoint moejepa_sidset.safetensors --dataset /path/to/sidset_test --split test
+```
+
+**Training.** `train/train.py` downloads [SID-Set](https://huggingface.co/datasets/saberzl/SID_Set)
+and trains with the configuration from the paper. Set `name_run` inside the script first.
+Checkpoints are written to `checkpoints/<name_run>/` and can be exported to the release
+format with:
+
+```bash
+python scripts/export_checkpoint.py --ckpt checkpoints/<name_run>/best-epoch=XX.ckpt --out moejepa.safetensors
+```
 
 ## Data
 

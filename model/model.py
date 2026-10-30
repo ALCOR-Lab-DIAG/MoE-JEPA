@@ -1,16 +1,16 @@
+import json
 import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoVideoProcessor
 from transformers import get_cosine_schedule_with_warmup
-from torch.utils.data import DataLoader
-from tqdm import tqdm
 import lightning as pl
 import torch.nn.functional as F
-import sys
-import math
-import wandb
 import torchmetrics
-from sklearn.metrics import accuracy_score, f1_score, recall_score, confusion_matrix
+from sklearn.metrics import accuracy_score, f1_score, recall_score
+
+BACKBONE_NAME = "facebook/vjepa2-vitl-fpc64-256"
+NUM_FRAMES = 4
+LABELS = ["real", "fake", "tampered"]
 
 class BayarConv2d(nn.Module):
     """
@@ -27,12 +27,13 @@ class BayarConv2d(nn.Module):
         self.weight = nn.Parameter(torch.zeros(out_channels, in_channels, kernel_size, kernel_size))
         nn.init.xavier_normal_(self.weight)
         
-        self.mask = torch.ones(out_channels, in_channels, kernel_size, kernel_size).cuda()
+        mask = torch.ones(out_channels, in_channels, kernel_size, kernel_size)
         center = kernel_size // 2
-        self.mask[:, :, center, center] = 0
+        mask[:, :, center, center] = 0
+        self.register_buffer("mask", mask, persistent=False)
 
     def forward(self, x):
-        masked_weight = self.weight * self.mask.to(self.weight.device)
+        masked_weight = self.weight * self.mask
         
         weight_sum = masked_weight.sum(dim=(2, 3), keepdim=True)
         norm_weight = masked_weight / (weight_sum + 1e-5)
@@ -445,8 +446,52 @@ class MoEJEPADeepfakeDetector(pl.LightningModule):
         density = router_probs.mean(dim=0)
         num_experts = router_probs.size(-1)
         loss = num_experts * torch.sum(density**2) - 1
-        return loss  
+        return loss
 
-if __name__ == "__main__":
-    MODEL_NAME = "facebook/vjepa2-vitl-fpc64-256"
-    model = MoEJEPADeepfakeDetector(MODEL_NAME)
+
+def load_processor(model_name=BACKBONE_NAME):
+    return AutoVideoProcessor.from_pretrained(model_name)
+
+
+def preprocess_image(img, processor, num_frames=NUM_FRAMES):
+    """
+    PIL image -> [T, C, H, W] tensor. V-JEPA 2 is a video model, so the image is
+    repeated as a static clip of `num_frames` frames (the model was trained with 4).
+    """
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    pixel_values = processor(img, return_tensors="pt")["pixel_values_videos"]
+    return pixel_values.repeat(1, num_frames, 1, 1, 1).squeeze(0)
+
+
+def load_moejepa(checkpoint_path, model_name=BACKBONE_NAME, device="cpu"):
+    """
+    Build MoE-JEPA and load trained weights for inference.
+
+    Accepts either the released `.safetensors` file (trained weights only; the frozen
+    V-JEPA 2 backbone is downloaded from the Hugging Face Hub) or a full Lightning
+    `.ckpt` produced by train/train.py.
+    """
+    if str(checkpoint_path).endswith(".safetensors"):
+        from safetensors import safe_open
+        from safetensors.torch import load_file
+        with safe_open(checkpoint_path, framework="pt") as f:
+            hparams = json.loads(f.metadata()["hyper_parameters"])
+        state_dict = load_file(checkpoint_path)
+    else:
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        hparams, state_dict = ckpt["hyper_parameters"], ckpt["state_dict"]
+
+    hparams = {**hparams, "model_name": model_name}
+    model = MoEJEPADeepfakeDetector(**hparams)
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    # Only weights of the frozen pretrained backbone may be absent from the checkpoint:
+    # those are already loaded by AutoModel.from_pretrained().
+    pretrained = model.model.state_dict()
+    missing = [k for k in missing if not (k.startswith("model.") and k[len("model."):] in pretrained
+                                          and ".mlp.routed_experts." not in k and ".mlp.router." not in k)]
+    if missing or unexpected:
+        raise RuntimeError(f"Checkpoint mismatch.\nMissing: {missing}\nUnexpected: {unexpected}")
+
+    return model.to(device).eval()

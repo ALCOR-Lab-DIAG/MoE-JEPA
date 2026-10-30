@@ -1,16 +1,11 @@
 import torch
-import torch.nn as nn
 import numpy as np
-from transformers import AutoModel, AutoVideoProcessor, AutoImageProcessor
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 import lightning as pl
 import sys
 import os
-import wandb
 from datetime import timedelta
-from datasets import load_dataset, load_from_disk
-from lightning.pytorch.loggers import WandbLogger
+from datasets import load_dataset
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from torchvision import transforms
@@ -20,12 +15,13 @@ from functools import partial
 
 SEED = 9999
 
-sys.path.append("..")
-from model.model import MoEJEPADeepfakeDetector3ClassesMOD
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from model.model import MoEJEPADeepfakeDetector, load_processor, preprocess_image, BACKBONE_NAME
 
-## Optional Wandb login
-#wandb_key = "<<YOUR KEY>>"
-#wandb.login(key=wandb_key)
+## Optional Wandb logging (pip install wandb)
+# import wandb
+# from lightning.pytorch.loggers import WandbLogger
+# wandb.login()
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
@@ -52,22 +48,12 @@ def prepare_sidset(examples, processor=None):
     processed_images = []
     
     # Process each example in the batch
-    for img, label in zip(examples['image'], examples['label']):
+    for img in examples['image']:
         if img.mode != "RGB":
             img = img.convert("RGB")
             
         img = augment_transform(img)
-
-        inputs = processor(img, return_tensors="pt")
-        if 'pixel_values_videos' in inputs:
-            pixel_values = inputs['pixel_values_videos']
-            pixel_values = pixel_values.repeat(1, 4, 1, 1, 1)
-            pixel_values = pixel_values.squeeze(0)
-        else:
-            pixel_values = inputs['pixel_values']
-            pixel_values = pixel_values.squeeze(0)
-            
-        processed_images.append(pixel_values)
+        processed_images.append(preprocess_image(img, processor))
 
     pixel_values_tot = torch.stack(processed_images)
 
@@ -97,8 +83,8 @@ def train():
         LAMBDA_ENERGY=0.9,
     )
     
-    MODEL_NAME = "facebook/vjepa2-vitl-fpc64-256"
-    model = MoEJEPADeepfakeDetector3ClassesMOD(MODEL_NAME, num_experts=args.NUM_EXPERTS, lr=args.LR, 
+    MODEL_NAME = BACKBONE_NAME
+    model = MoEJEPADeepfakeDetector(MODEL_NAME, num_experts=args.NUM_EXPERTS, lr=args.LR, 
                                             aux_loss_weight=args.AUX_LOSS_WEIGHT, router_temperature=args.ROUTER_TEMPERATURE, 
                                             top_k = args.TOP_K, weight_decay=args.WEIGHT_DECAY, train_last_n_layers=args.TRAIN_LAST_N_LAYERS, 
                                             unfreeze_last_n_blocks=args.UNFREEZE_LAST_N_BLOCKS, do_noise_stream=args.NOISE_STREAM, 
@@ -107,10 +93,7 @@ def train():
     print(model)
     model.train()
 
-    try:
-        processor = AutoVideoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    except ValueError:
-        processor = AutoImageProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    processor = load_processor(MODEL_NAME)
 
     print("download dataset...")
     dataset = load_dataset("saberzl/SID_Set")

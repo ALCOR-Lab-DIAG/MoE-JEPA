@@ -1,105 +1,54 @@
-import torch
-import torch.nn as nn
-import numpy as np
-from transformers import AutoModel, AutoVideoProcessor, AutoImageProcessor
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-import lightning as pl
+import os
 import sys
 import argparse
-from datetime import timedelta
-from lightning.pytorch.strategies import DDPStrategy
-import os
-import json 
-from datasets import load_from_disk, load_dataset
+import torch
+import lightning as pl
+from torch.utils.data import DataLoader
+from datasets import load_dataset, load_from_disk, DatasetDict
 
-sys.path.append("..")
-from model.model import MoEJEPADeepfakeDetector
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from model.model import load_moejepa, load_processor, preprocess_image, BACKBONE_NAME, NUM_FRAMES
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {device}")
-
-def prepare_sidset(examples, processor):
-    processed_images = []
-    for img in examples['image']:
-        try:
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-
-            inputs = processor(img, return_tensors="pt")
-
-            # Auto-detect: video processors return 'pixel_values_videos',
-            # image processors return 'pixel_values'
-            if 'pixel_values_videos' in inputs:
-                pixel_values = inputs['pixel_values_videos']
-                pixel_values = pixel_values.repeat(1, 2, 1, 1, 1)
-                pixel_values = pixel_values.squeeze(0)
-            else:
-                pixel_values = inputs['pixel_values']
-                pixel_values = pixel_values.squeeze(0)  # [1, 3, H, W] -> [3, H, W]
-
-            processed_images.append(pixel_values)
-        except Exception as e:
-            print(f"Skipping corrupted image. Error: {e}")
-            continue
-
-    pixel_values_tot = torch.stack(processed_images)
-
-    return {
-        'pixel_values': pixel_values_tot,
-        'label': torch.tensor(examples['label'])
-    }
 
 class PrepareTransform:
     """Picklable transform wrapper (lambdas can't be pickled with forkserver)."""
-    def __init__(self, processor):
+    def __init__(self, processor, num_frames):
         self.processor = processor
+        self.num_frames = num_frames
 
     def __call__(self, examples):
-        return prepare_sidset(examples, self.processor)
+        pixel_values = [preprocess_image(img, self.processor, self.num_frames) for img in examples['image']]
+        return {
+            'pixel_values': torch.stack(pixel_values),
+            'label': torch.tensor(examples['label'])
+        }
 
-def is_corrupt(example):
-    try:
-        img = example['image']
-        if hasattr(img, 'getexif'):
-            img.getexif() 
-        return False
-    except Exception:
-        return True
-
-PIXEL_LIMIT = 89478485 
-
-def is_safe_size(example):
-    img = example['image']
-    width, height = img.size 
-    return (width * height) <= PIXEL_LIMIT
-
-def filter_sidset(dataset):
-    # labels_train = np.array(dataset['test']['label'])
-    # keep_indices = np.where(labels_train != 2)[0]
-    # dataset['test'] = dataset['test'].select(keep_indices)
-    # labels_val = np.array(dataset['validation']['label'])
-    # keep_indices = np.where(labels_val != 2)[0]
-    # dataset['validation'] = dataset['validation'].select(keep_indices)
-    labels_train = np.array(dataset['label'])
-    keep_indices = np.where(labels_train != 2)[0]
-    dataset= dataset.select(keep_indices)
-    return dataset
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Test MoE-JEPA Deepfake Detector")
     parser.add_argument(
-        "--model_name", type=str, required=True,
-        help="HuggingFace model name or local path"
-    )
-    parser.add_argument(
         "--checkpoint", type=str, required=True,
-        help="Path to the .ckpt checkpoint file"
+        help="Released .safetensors weights or a .ckpt produced by train.py"
     )
     parser.add_argument(
-        "--dataset", type=str,
-        default="<<YOUR LOCAL PATH>>",
-        help="Path to the test dataset"
+        "--dataset", type=str, required=True,
+        help="Local dataset saved with save_to_disk(), or a Hugging Face Hub dataset id"
+    )
+    parser.add_argument(
+        "--split", type=str, default="test",
+        help="Split to evaluate if the dataset has several (default: test)"
+    )
+    parser.add_argument(
+        "--model_name", type=str, default=BACKBONE_NAME,
+        help=f"V-JEPA 2 backbone, HF id or local path (default: {BACKBONE_NAME})"
+    )
+    parser.add_argument(
+        "--num_frames", type=int, default=NUM_FRAMES,
+        help=f"Frames each image is repeated to (default: {NUM_FRAMES}, as in training)"
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None,
+        help="Evaluate only the first N images"
     )
     parser.add_argument(
         "--batch_size", type=int, default=16,
@@ -111,79 +60,60 @@ def parse_args():
     )
     return parser.parse_args()
 
+
+def load_split(path, split):
+    dataset = load_from_disk(path) if os.path.exists(path) else load_dataset(path)
+    if isinstance(dataset, DatasetDict):
+        if split not in dataset:
+            if len(dataset) != 1:
+                raise ValueError(f"Split '{split}' not found. Available: {list(dataset.keys())}")
+            split = next(iter(dataset))
+        dataset = dataset[split]
+    return dataset
+
+
 def test(args):
-    MODEL_NAME = args.model_name
-    checkpoint_path = args.checkpoint
-    dataset_path = args.dataset
+    model = load_moejepa(args.checkpoint, model_name=args.model_name)
+    processor = load_processor(args.model_name)
 
-    model = MoEJEPADeepfakeDetector.load_from_checkpoint(
-        checkpoint_path, model_name=MODEL_NAME, strict=False, map_location="cuda"
-    )
-    model.to("cuda")
-    model.eval()
-    
-    try:
-        processor = AutoVideoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True)
-        print(f"Loaded VideoProcessor for: {MODEL_NAME}")
-    except (ValueError, KeyError):
-        processor = AutoImageProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True)
-        print(f"Loaded ImageProcessor for: {MODEL_NAME}")
-
-    # Load Dataset
-    test_dataset = load_from_disk(dataset_path)
-
+    test_dataset = load_split(args.dataset, args.split)
+    if args.limit is not None:
+        test_dataset = test_dataset.select(range(min(args.limit, len(test_dataset))))
     print(test_dataset)
 
-    # print("filtering tampered images...")
-    # test_dataset = filter_sidset(test_dataset)
+    print(f"Testing the model: {args.checkpoint}")
+    print(f"Running test on dataset: {args.dataset}")
+    print(f"Backbone: {args.model_name}")
 
-    if 'train' in test_dataset:
-        test_dataset['test'] = test_dataset.pop('train')
-
-    if isinstance(test_dataset, dict) or hasattr(test_dataset, 'keys'):
-        if 'test' in test_dataset:
-            test_dataset = test_dataset['test']
-
-    print(f"Testing the model: {checkpoint_path}")
-    print(f"Running test on dataset: {dataset_path}")
-    print(f"Backbone: {MODEL_NAME}")
-
-    test_dataset.set_transform(PrepareTransform(processor))
+    test_dataset.set_transform(PrepareTransform(processor, args.num_frames))
     test_dataloader = DataLoader(
         test_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, persistent_workers=True
+        num_workers=args.num_workers, persistent_workers=args.num_workers > 0
     )
 
-    custom_ddp_strategy = DDPStrategy(
-        timeout=timedelta(seconds=7200),  # 2 hours: protects against large epoch-end syncs
-        find_unused_parameters=True,      # Required for MoE if some experts aren't used in a batch
-        gradient_as_bucket_view=True      # Reduces memory fragmentation on 40GB cards
-    )
-
+    cuda = torch.cuda.is_available()
     trainer = pl.Trainer(
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=1, 
+        accelerator="gpu" if cuda else "cpu",
+        devices=1,
         logger=False,
-        strategy=custom_ddp_strategy,
-        precision="bf16-mixed", 
+        precision="bf16-mixed" if cuda else "32-true",
     )
 
     results = trainer.test(model, test_dataloader)
 
-
     log_file_path = "test_results_json.txt"
     with open(log_file_path, "a") as f:
         f.write("--- Deepfake Detection Test Results ---\n")
-        f.write(f"Checkpoint: {checkpoint_path}\n")
-        f.write(f"Backbone: {MODEL_NAME}\n")
-        f.write(f"Dataset: {dataset_path}\n")
+        f.write(f"Checkpoint: {args.checkpoint}\n")
+        f.write(f"Backbone: {args.model_name}\n")
+        f.write(f"Dataset: {args.dataset} [{args.split}]\n")
         f.write("-" * 40 + "\n")
-        
+
         for i, res in enumerate(results):
             f.write(f"Results for Dataloader {i}:\n")
             for metric, value in res.items():
                 f.write(f"{metric}: {value:.4f}\n")
-        
+
         f.write("-" * 40 + "\n")
         f.write("*" * 80 + "\n")
         f.write("*" * 80 + "\n\n\n")
